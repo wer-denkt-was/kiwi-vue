@@ -1,0 +1,77 @@
+{
+  "name": "@werdenktwas/kiwi-vue",
+  "version": "1.2.0",
+  "license": "EUPL-1.2",
+  "description": "Vue.js library for projects using the Kiwi-Framework",
+  "author": "Alexander Dahmen <dahmen@werdenktwas.de> (https://github.com/AlexanderDahmen)",
+  "contributors": [
+    "Dr. Tobias Klug <klug@werdenktwas.de>",
+    "Dr. Steffen Schnitzer <schnitzer@werdenktwas.de>",
+    "Zoey Feld <feld@werdenktwas.de>"
+  ],
+  "sponsor": {
+    "url": "https://werdenktwas.de"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "vue-tsc -b && vite build",
+    "clean": "rimraf dist/",
+    "lint": "eslint . --fix",
+    "format": "prettier --write src/"
+  },
+  "peerDependencies": {
+    "vue": "^3.5.35"
+  },
+  "devDependencies": {
+    "@tsconfig/node22": "^22.0.5",
+    "@types/node": "^22.19.19",
+    "@vitejs/plugin-vue": "^6.0.7",
+    "@vue/eslint-config-prettier": "^10.2.0",
+    "@vue/eslint-config-typescript": "^14.7.0",
+    "@vue/tsconfig": "^0.9.1",
+    "eslint": "^9.39.4",
+    "eslint-plugin-vue": "^10.9.1",
+    "jiti": "^2.7.0",
+    "prettier": "^3.8.3",
+    "rimraf": "^6.1.3",
+    "typescript": "~5.9.3",
+    "unplugin-auto-import": "^21.0.0",
+    "unplugin-vue-components": "^32.1.0",
+    "vite": "^8.0.15",
+    "vite-plugin-dts": "^5.0.1",
+    "vite-plugin-vue-devtools": "^8.1.2",
+    "vue": "^3.5.35",
+    "vue-tsc": "^3.3.3"
+  },
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./api": {
+      "types": "./dist/api.d.ts",
+      "import": "./dist/api.js"
+    },
+    "./components": {
+      "types": "./dist/components.d.ts",
+      "import": "./dist/components.js"
+    },
+    "./services": {
+      "types": "./dist/services.d.ts",
+      "import": "./dist/services.js"
+    },
+    "./utils": {
+      "types": "./dist/utils.d.ts",
+      "import": "./dist/utils.js"
+    },
+    "./tooling": {
+      "types": "./dist/tooling.d.ts",
+      "import": "./dist/tooling.js"
+    }
+  },
+  "files": [
+    "/dist"
+  ]
+}
