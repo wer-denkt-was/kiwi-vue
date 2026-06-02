@@ -1,6 +1,6 @@
 {
   "name": "@werdenktwas/kiwi-vue",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "license": "EUPL-1.2",
   "description": "Vue.js library for projects using the Kiwi-Framework",
   "author": "Alexander Dahmen <dahmen@werdenktwas.de> (https://github.com/AlexanderDahmen)",
