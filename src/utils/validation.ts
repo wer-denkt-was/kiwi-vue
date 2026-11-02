@@ -98,13 +98,17 @@ const notEmpty = (x: undefined | string): boolean => x !== undefined && x !== ''
 /** Create a conditional rule, only validating if the value is not falsy (`false`, `null`, `undefined`, `""`, or `0`). */
 export const validateOptional = <T>(then: ValidationRule<T>) => validateIf(Boolean, then)
 
+/**
+ * Create a rule validating that a string value has a valid integer format (see {@link isLikeInt}),
+ * and validating the parsed integer using the given rule.
+ */
 export const validateAsInt = (message: InvalidMessage, then: ValidationRule<number>): ValidationRule<string> => {
   return value => {
-    if (!value) {
+    const trimmed = value?.trim()
+    if (!trimmed || !/^[-+]?\d+$/.test(trimmed)) {
       return message
     } else {
-      const number = Number.parseInt(value)
-      return Number.isNaN(number) ? message : then(number)
+      return then(Number.parseInt(trimmed, 10))
     }
   }
 }

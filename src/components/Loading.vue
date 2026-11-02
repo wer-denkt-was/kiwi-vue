@@ -1,4 +1,4 @@
-<script setup lang="ts" generic="T">
+<script generic="T" lang="ts" setup>
 import type { LoadingService, LoadingState } from '@/services'
 
 defineSlots<{
@@ -21,5 +21,5 @@ const result = computed((): LoadingState<T> => {
   <slot v-else-if="result.loading === 'pending'" :previous-data="result.previousResult" name="pending" />
   <slot v-else-if="result.loading === 'loaded'" :data="result.result" name="loaded" />
   <slot v-else-if="result.loading === 'failed'" :error="result.error" name="failed" />
-  <slot v-else name="unknown" :unreachable="result" />
+  <slot v-else :unreachable="result" name="unknown" />
 </template>

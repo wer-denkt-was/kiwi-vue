@@ -45,14 +45,18 @@ export interface LoadingOptions {
    * If `true` (default), switch to pending-state immediately.
    * Otherwise, remain in the current state until the loading-operation completes.
    */
-  pending?: boolean
+  readonly pending?: boolean
 
   /**
    * An {@link AbortController} that will receive a signal if another `LoadingService.load` operation is invoked
-   * before this operation is completed. Can be used to cancel the ongoing loading operation, as its results will
-   * be ignored by the `LoadingService` after a new operation has been started.
+   * (or the service is reset) before this operation is completed. Can be used to cancel the ongoing loading
+   * operation, as its results will be ignored by the `LoadingService` after a new operation has been started.
+   * @example ```ts
+   * const abort = new AbortController()
+   * await todoItems.load(todoItemService.findPage({ signal: abort.signal }), { abort })
+   * ```
    */
-  abort?: AbortController
+  readonly abort?: AbortController
 }
 
 /**
@@ -85,7 +89,10 @@ export interface LoadingService<T> {
   /** Replace the previously loaded result without triggering another load */
   replace(mapper: (result: T) => T): void
 
-  /** Computed ref of a mapping of the current loading state */
+  /** Immediately emplace a result value, instantly setting the loading operation to be completed */
+  emplace(value: T): void
+
+  /** Computed ref of a mapping of the current loading state, mapping the previous result of a pending state as well */
   computeState<R>(mapper: (result: T) => R): ComputedRef<LoadingState<R>>
 
   /** Computed ref mapping the currently loaded result, or a pending placeholder value */
@@ -99,7 +106,7 @@ export interface LoadingService<T> {
   /** Computed ref of the currently loaded result, or a pending placeholder value  */
   resultOrElse(pending: MaybeRefOrGetter<T>): ComputedRef<T>
 
-  /** Reset the state of the service back to "idle" */
+  /** Reset the state of the service back to "idle", aborting and ignoring an ongoing loading operation */
   reset(): void
 }
 
@@ -115,7 +122,11 @@ class LoadingServiceImpl<T> implements LoadingService<T> {
    * Reactive state of the LoadingService instance
    */
   public readonly state = shallowRef<LoadingState<T>>(LoadingState.idle)
-
+  readonly isLoading: ComputedRef<boolean> = computed(() => this.state.value.loading === 'pending')
+  readonly resultOrNull: ComputedRef<null | T> = computed(() => {
+    const state = this.state.value
+    return state.loading === 'loaded' ? state.result : null
+  })
   /**
    * Only the latest value should be published in the state.
    * For this reason, a local variable tracks the "latest" promise,
@@ -124,56 +135,68 @@ class LoadingServiceImpl<T> implements LoadingService<T> {
    * the new operation will replace the previous operation.
    */
   private _latestOperation?: Promise<T>
-  private _latestAbortController?: undefined | AbortController
-  private _latestResult?: T
-
-  readonly isLoading: ComputedRef<boolean> = computed(() => this.state.value.loading === 'pending')
-
-  readonly resultOrNull: ComputedRef<null | T> = computed(() => {
-    const state = this.state.value
-    return state.loading === 'loaded' ? state.result : null
-  })
+  private _latestAbortController?: AbortController
+  private _latestResult?: { readonly value: T }
 
   async load<R extends T>(operation: Promise<R>, pendingOrOptions?: boolean | LoadingOptions): Promise<R> {
     const { pending = true, abort } = decodeLoadingOptions(pendingOrOptions)
 
     // Cancel ongoing operation, if any is still currently active
-    this._latestAbortController?.abort(operation)
+    this.abortLatestOperation()
+
+    // Begin loading operation, and if requested, switch to pending-state
+    this._latestOperation = operation
+    this._latestAbortController = abort
+    if (pending) this.changeToPending()
 
     try {
-      // Begin loading operation
-      this._latestOperation = operation
-      this._latestAbortController = abort
-
-      // If requested, switch to idle-state
-      if (pending ?? true) this.changeToPending()
-
       // Asynchronously wait for loading operation to finish
       const result = await operation
 
       // Loading finished successfully
-      this._latestResult = result
-      this.changeState(operation, LoadingState.loaded(result))
+      if (this.isLatestOperation(operation)) {
+        this._latestResult = { value: result }
+        this.state.value = LoadingState.loaded(result)
+      }
       return result
     } catch (error: unknown) {
       // Loading finished with an error
-      delete this._latestResult
-      this.changeState(operation, LoadingState.failed(error))
-      return Promise.reject(error)
+      if (this.isLatestOperation(operation)) {
+        delete this._latestResult
+        this.state.value = LoadingState.failed(error)
+      }
+      throw error
     } finally {
-      // Cleanup abort controller
-      delete this._latestAbortController
+      // Cleanup, unless another operation has been started in the meantime
+      if (this.isLatestOperation(operation)) {
+        delete this._latestOperation
+        delete this._latestAbortController
+      }
     }
   }
 
   replace(mapper: (result: T) => T): void {
     const state = this.state.value
     if (state.loading === 'loaded') {
-      this.state.value = LoadingState.loaded(mapper(state.result))
+      const result = mapper(state.result)
+      this._latestResult = { value: result }
+      this.state.value = LoadingState.loaded(result)
     }
   }
 
+  emplace(value: T): void {
+    // Cancel and ignore ongoing operation, if any is still currently active
+    this.abortLatestOperation()
+    delete this._latestOperation
+    this._latestResult = { value }
+    this.state.value = LoadingState.loaded(value)
+  }
+
   reset(): void {
+    // Cancel and ignore ongoing operation, if any is still currently active
+    this.abortLatestOperation()
+    delete this._latestOperation
+    delete this._latestResult
     this.state.value = LoadingState.idle
   }
 
@@ -181,10 +204,11 @@ class LoadingServiceImpl<T> implements LoadingService<T> {
     return computed((): LoadingState<R> => {
       const state = this.state.value
       if (state.loading === 'loaded') {
-        const result = mapper(state.result)
-        return { loading: 'loaded', result }
+        return LoadingState.loaded(mapper(state.result))
       } else if (state.loading === 'pending') {
-        return LoadingState.pending()
+        return 'previousResult' in state
+          ? LoadingState.pending(mapper(state.previousResult as T))
+          : LoadingState.pending()
       } else {
         return state
       }
@@ -225,29 +249,29 @@ class LoadingServiceImpl<T> implements LoadingService<T> {
   }
 
   private changeToPending() {
-    if ('_latestResult' in this) {
-      this.state.value = LoadingState.pending(this._latestResult)
-    } else {
-      this.state.value = LoadingState.pending()
-    }
+    this.state.value = this._latestResult ? LoadingState.pending(this._latestResult.value) : LoadingState.pending()
   }
 
-  private changeState(source: Promise<T>, state: LoadingState<T>): void {
-    // Only mutate instance-state if given source is still the latest currently active operation.
-    // Otherwise, another operation has asynchronously been started in the meantime,
+  private abortLatestOperation() {
+    const abortController = this._latestAbortController
+    delete this._latestAbortController
+    abortController?.abort()
+  }
+
+  private isLatestOperation(operation: Promise<T>): boolean {
+    // Only mutate instance-state if given operation is still the latest currently active operation.
+    // Otherwise, another operation has asynchronously been started in the meantime (or the service has been reset),
     // and outdated state changes are ignored.
-    if (source === this._latestOperation) {
-      this.state.value = state
-    }
+    return operation === this._latestOperation
   }
 }
 
-function decodeLoadingOptions(argument: undefined | boolean | LoadingOptions): LoadingOptions {
-  if (argument === undefined) {
+function decodeLoadingOptions(variant: undefined | boolean | LoadingOptions): LoadingOptions {
+  if (variant === undefined) {
     return { pending: true }
-  } else if (typeof argument === 'boolean') {
-    return { pending: argument }
+  } else if (typeof variant === 'boolean') {
+    return { pending: variant }
   } else {
-    return argument
+    return variant
   }
 }

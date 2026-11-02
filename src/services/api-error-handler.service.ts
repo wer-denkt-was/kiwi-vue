@@ -1,4 +1,5 @@
 import { errorMessage } from '@/utils/error'
+import { ApiError } from '@/api'
 
 /** Service for handling errors by transforming and displaying error messages */
 export interface ApiErrorHandler {
@@ -33,6 +34,11 @@ export interface ApiErrorDetails {
   readonly error: unknown
   readonly rawMessage: string
   readonly formattedMessage: string
+  /**
+   * Details of nested errors, e.g. one per invalid field of an `entity-body-invalid` error.
+   * @see ApiError.errors
+   */
+  readonly causes?: ReadonlyArray<ApiErrorDetails>
 }
 
 /** Provided interface for functions accepting transformed {@link ApiErrorDetails} from an {@link ApiErrorHandler} */
@@ -68,14 +74,34 @@ export function useApiErrorHandler(): ApiErrorHandler {
   return inject(apiErrorHandlerKey, fallbackApiErrorHandler)
 }
 
-/** Simple error transformer, extracting a string from an error and using it as a message */
-export const simpleApiErrorTransformer: ApiErrorTransformer = (error: unknown): ApiErrorDetails => {
-  const message = errorMessage(error)
-  return { error, rawMessage: message, formattedMessage: message }
+/**
+ * Create an {@link ApiErrorTransformer} from a function formatting {@link ApiError}s,
+ * which returns `undefined` if no message is available for an error.
+ * - Nested errors of an {@link ApiError} (see {@link ApiError.errors}) are transformed into
+ *   {@link ApiErrorDetails.causes}. If no message is available for an error with nested errors, its formatted message
+ *   consists of the formatted messages of the nested errors, one per line.
+ * - Other errors are formatted using their message, see {@link errorMessage}.
+ */
+export function apiErrorTransformer(formatApiError: (error: ApiError) => undefined | string): ApiErrorTransformer {
+  const transform: ApiErrorTransformer = error => {
+    const rawMessage = errorMessage(error)
+    if (!(error instanceof ApiError)) {
+      return { error, rawMessage, formattedMessage: rawMessage }
+    }
+
+    const causes = error.errors.map(transform)
+    const formattedMessage =
+      formatApiError(error) ?? (causes.length > 0 ? causes.map(cause => cause.formattedMessage).join('\n') : rawMessage)
+    return causes.length > 0 ? { error, rawMessage, formattedMessage, causes } : { error, rawMessage, formattedMessage }
+  }
+  return transform
 }
 
+/** Simple error transformer, extracting a string from an error and using it as a message */
+export const simpleApiErrorTransformer: ApiErrorTransformer = apiErrorTransformer(() => undefined)
+
 const fallbackApiErrorHandler = createApiErrorHandler(simpleApiErrorTransformer, [
-  () => console.warn('Warning: No ErrorHandler installed, please use provideErrorHandler'),
+  () => console.warn('Warning: No ApiErrorHandler installed, please use provideApiErrorHandler'),
   consoleErrorConsumer,
 ])
 

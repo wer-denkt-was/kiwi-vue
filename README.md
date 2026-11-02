@@ -8,6 +8,13 @@ and a set of Vue components.
 
 Designed to integrate with a [Kiwi-Framework](https://github.com/wer-denkt-was/kiwi-framework) application server.
 
+| Kiwi-Vue | Kiwi-Server |
+|----------|-------------|
+| 2.x      | 1.5         |
+| 1.x      | 1.4         |
+
+Upgrading from Kiwi-Vue 1.x? See the [changelog](CHANGELOG.md#migrating-from-1x) for the migration guide.
+
 ## Installation
 
 ```sh
@@ -32,19 +39,25 @@ npm install @werdenktwas/kiwi-vue
 ### Setting up the API client
 
 Call `provideApi` once at the application root (inside a `setup` context). Child components and services access it via
-`useApi`.
+`useApi`. Use `createApi` to create an instance outside of components, e.g. in stores, and pass it to `provideApi`.
 
 ```ts
-import { provideApi, JwtBearerToken } from '@werdenktwas/kiwi-vue/services'
+import { provideApi } from '@werdenktwas/kiwi-vue/services'
+import { JwtBearerToken } from '@werdenktwas/kiwi-vue/api'
 
 // In a root component setup()
 const credentials = ref(new JwtBearerToken(token))
 
 provideApi({
-  apiUrl: 'https://api.example.com/',
+  apiUrl: 'https://api.example.com/', // a trailing slash is appended if missing
   credentials, // MaybeRefOrGetter<ApiCredentials> — reactive
+  // fetch: customFetch, // optional fetch implementation
 })
 ```
+
+Request paths are always resolved relative to the API URL; leading slashes are ignored. With the API URL
+`https://api.example.com/v1`, the path `/TodoItem` requests `https://api.example.com/v1/TodoItem`. Pass a `URL` to
+`api.request(url, init)` to request an absolute URL.
 
 #### Credentials
 
@@ -52,7 +65,7 @@ provideApi({
 |--------------------------------------------|------------------------------------------------------------------------------------|
 | `missingCredentials`                       | No authentication                                                                  |
 | `new UsernamePassword(username, password)` | HTTP Basic (`Authorization: Basic …`)                                              |
-| `new JwtBearerToken(token)`                | Bearer token (`Authorization: Bearer …`); validates expiration via JWT `exp` claim |
+| `new JwtBearerToken(token, leeway?)`       | Bearer token (`Authorization: Bearer …`); validates expiration via JWT `exp` claim |
 | `bearerToken(token)`                       | Factory for a bearer-token `AuthenticateRequestFn`                                 |
 | `httpBasic(user, pass)`                    | Factory for a Basic-auth `AuthenticateRequestFn`                                   |
 | `addRequestHeader(name, value)`            | Add an arbitrary request header                                                    |
@@ -60,42 +73,143 @@ provideApi({
 Compose multiple authentication functions with `AuthenticateRequestFn.compose(fn1, fn2, ...)`. A credential may also
 provide a `rewrite` function to rewrite request URLs (e.g. for proxies).
 
-`JwtBearerToken.isValid()` returns `false` once the token's `exp` claim is in the past — `provideApi` will throw
-`CredentialsInvalid` on the next request.
+`JwtBearerToken.isValid()` returns `false` once the token's `exp` claim is in the past (minus an optional leeway in
+seconds) — the next request will then be rejected with `CredentialsInvalid`. Tokens without `exp` claim never expire.
+
+> Kiwi-Server 1.5 removed its built-in JWT support: bearer tokens are validated by the application's Spring Security
+> configuration, e.g. as an OAuth2 resource server. `JwtBearerToken` works with any such setup, as it only sends the
+> token and reads its expiration.
+
+#### Session cookies (OAuth2/OIDC login)
+
+Applications can authenticate using a session cookie instead of a token: The login navigates the browser to the server
+(e.g. Spring Security's `oauth2Login`), which performs the OAuth2/OIDC login, establishes a session (e.g. Spring
+Session), and redirects back to the application, setting the session cookie.
+`SessionCredentials` let the browser send this cookie with each request (`credentials: 'include'`), and send the CSRF
+token with XHR/`fetch` requests.
+
+**Session authentication example**:
+
+```ts
+import {
+  createApi,
+  createSession,
+  provideApi,
+  provideSession,
+  unwrapResponseJson,
+} from '@werdenktwas/kiwi-vue/services'
+import { csrfTokenEndpoint, SessionCredentials } from '@werdenktwas/kiwi-vue/api'
+
+const apiUrl = new URL('https://api.example.com/')
+const csrf = csrfTokenEndpoint(new URL('csrf', apiUrl))
+const api = createApi({ apiUrl, credentials: new SessionCredentials({ csrf }) })
+
+const session = createSession({
+  loadUser: signal => api.request('UserAccount/me', {}, { signal }).then(unwrapResponseJson<IUserAccount>),
+  loginUrl: returnUrl => new URL(`login?returnUrl=${encodeURIComponent(returnUrl)}`, apiUrl),
+  logoutUrl: new URL('logout', apiUrl),
+  csrf,
+})
+
+// In the root component setup()
+provideApi(api)
+provideSession(session)
+session.refresh().catch(handleError) // null if not authenticated
+
+// In components
+const { user, isAuthenticated, login, logout } = useSession<IUserAccount>()
+```
+
+| Option of `SessionCredentials` | Default   | Description                                                                         |
+|--------------------------------|-----------|-------------------------------------------------------------------------------------|
+| `credentials`                  | `include` | `include` sends cookies to other origins as well, `same-origin` only to the own one |
+| `csrf`                         | -         | `CsrfTokenSource`, its token is sent with all requests except `GET`, `HEAD`, etc.   |
+| `redirect`                     | `manual`  | `manual` rejects redirects (to a login page) with `UnauthorizedError`               |
+
+Requests without authenticated session reject with an `UnauthorizedError`, either by status `401`, or by a redirect,
+e.g. to the login page (status `0`, detail `redirected: true`), as redirects are not followed.
+
+CSRF token sources (`CsrfTokenSource`):
+
+- `csrfTokenEndpoint(url)` requests the token (`{ token, headerName, parameterName }`) from a server endpoint once, when
+  it is first needed; `refresh()` requests it again.
+- `csrfTokenCookie(options?)` reads the token from the `XSRF-TOKEN` cookie of Spring Security's
+  `CookieCsrfTokenRepository.withHttpOnlyFalse()`, sent as `X-XSRF-TOKEN` header. The application can only read the
+  cookie if it is set for its domain, e.g. `example.com` for `app.example.com` and `api.example.com`.
+
+The `SessionService` (`createSession`, `provideSession`, `useSession`) tracks the session user as `LoadingState`, which
+is `null` if not authenticated. `login(returnUrl?)` navigates to the login URL, `logout()` submits a `POST` form with
+the CSRF token to the logout URL (or navigates to it with `logoutMethod: 'GET'`). Call `refresh(false)` periodically to
+detect an expired session without switching to the pending state.
+
+Use `extendCredentials(credentials, ...fns)` to add request headers to credentials, keeping their CSRF handling:
+`extendCredentials(new SessionCredentials({ csrf }), addRequestHeader('X-Tenant-Id', tenantId))`. Credentials can
+implement `prepare(init)` to load data asynchronously before a request is authenticated, as `SessionCredentials` does
+for the CSRF token.
+
+**Server requirements**:
+
+- **CORS** with credentials if the application is served from another origin, e.g. `kiwi.web.global-cors` with
+  `allowed-origins` and `allow-credentials: true`, and `cors { }` in the Spring Security filter chain.
+- **Cookies**: Browsers only send cookies with `SameSite=Lax` (the default of Spring Session) to the same site, e.g.
+  from `app.example.com` to `api.example.com`. Other sites require `SameSite=None; Secure`, which browsers blocking
+  third-party cookies don't send either. Prefer serving application and API from the same site.
+- **CSRF token endpoint** for `csrfTokenEndpoint`, permitted for all requests:
+  ```kotlin
+  @RestController
+  class CsrfController {
+      @GetMapping("/csrf")
+      fun csrf(token: CsrfToken): CsrfToken = token
+  }
+  ```
+- **Logout** via `POST` with CSRF token (Spring Security's default), or via `GET` if configured so.
 
 ### CRUD services with `basicCrudService`
 
-`basicCrudService<T, ID>(entityType)` generates a class that implements `CrudService<T, ID>` against conventional REST
-endpoints.
+`basicCrudService<T, ID, C, U>(entityType)` generates a class that implements `CrudService<T, ID, C, U>` against the
+generic entity endpoints of Kiwi-Server. The type parameters are the entity (fieldset) type `T`, its ID type `ID`, and
+the JSON body types of create (`C`) and update (`U`) commands. The TypeScript sources generated by Kiwi-Server's
+`TypescriptFieldsetSourceRenderer` provide all of them:
 
 ```ts
 import { basicCrudService, useApiService } from '@werdenktwas/kiwi-vue/services'
+import type { ICreateTodoItem, ITodoItemDefault, IUpdateTodoItem, TodoItemId } from './demo.model'
 
-interface User {
-  id: number;
-  name: string
-}
-
-class UserService extends basicCrudService<User, number>('User') {
+class TodoItemService extends basicCrudService<ITodoItemDefault, TodoItemId, ICreateTodoItem, IUpdateTodoItem>(
+  'TodoItem',
+) {
 }
 
 // In a component setup()
-const userService = useApiService(UserService)
+const todoItemService = useApiService(TodoItemService)
+await todoItemService.update(id, { title: 'Bread' }) // PATCH: only "title" is changed
 ```
 
-| Method                      | HTTP call            | Description                     |
-|-----------------------------|----------------------|---------------------------------|
-| `findById(id, options?)`    | `GET /User/{id}`     | Returns `null` for 404          |
-| `requireById(id, options?)` | `GET /User/{id}`     | Throws `EntityNotFound` for 404 |
-| `findPage(options?)`        | `GET /User?{params}` | Returns `IPage<T>`              |
-| `create(body)`              | `POST /User`         | Returns created entity          |
-| `update(id, body)`          | `PUT /User/{id}`     | Returns updated entity          |
-| `delete(id)`                | `DELETE /User/{id}`  | Returns deleted entity          |
+| Method                      | HTTP call                | Description                         |
+|-----------------------------|--------------------------|-------------------------------------|
+| `findById(id, options?)`    | `GET /TodoItem/{id}`     | Returns `null` for 404              |
+| `requireById(id, options?)` | `GET /TodoItem/{id}`     | Throws `EntityNotFound` for 404     |
+| `findPage(options?)`        | `GET /TodoItem?{params}` | Returns `IPage<T>`                  |
+| `create(body, options?)`    | `POST /TodoItem`         | Returns created entity              |
+| `update(id, body, opts?)`   | `PATCH /TodoItem/{id}`   | Partial update, returns entity      |
+| `delete(id, options?)`      | `DELETE /TodoItem/{id}`  | Returns deleted entity              |
+| `fetchMetadata(options?)`   | `GET /TodoItem/_schema`  | Returns `GenericMetadata` of entity |
+
+IDs are URL-encoded in paths. Updates are partial (`PATCH`): Kiwi-Server only changes the properties present in the
+body, and rejects unknown properties, so only send the properties declared by the update command.
+
+`fetchMetadata()` returns the entity's `GenericMetadata`: its fieldsets, columns, relations, query filter properties,
+and
+the body properties of create and update commands including whether they are `required`.
 
 #### Options
 
 ```ts
-interface FindOptions {
+interface RequestOptions {
+  signal?: AbortSignal // abort the request
+}
+
+interface FindOptions extends RequestOptions {
   fieldset?: string
   fields?: string
   accelerate?: boolean
@@ -105,10 +219,30 @@ interface FindOptions {
 interface FindPageOptions {
   pageSize?: number
   pageNumber?: number
-  filter?: Record<string, ParamValues> // extra query params
+  filter?: Record<string, ParamValues> // entity filter properties and column filters
   sort?: Sort[] // [{ field: 'name', direction: 'asc' }]
 }
 ```
+
+#### Column filters
+
+Kiwi-Server filters entities by columns of the entity schema using parameters `<column>=<values>` (default operator,
+`in` for built-in column types) or `<column>:<operator>=<values>`. `columnFilter(column, operator, values)` (from
+`api`) creates such a parameter, escaping commas and backslashes within values:
+
+```ts
+import { columnFilter } from '@werdenktwas/kiwi-vue/api'
+
+await todoItemService.findPage({
+  filter: {
+    ...columnFilter('status', undefined, ['Open', 'Done']), // status=Open,Done
+    ...columnFilter('title', 'contains', 'Milk, 2l'), // title:contains=Milk\, 2l
+    ...columnFilter('order', 'ge', 1), // order:ge=1
+  },
+})
+```
+
+Built-in operators: `in`, `not`, `eq`, `ne`, `null`, `gt`, `ge`, `lt`, `le`, `contains`, `startsWith`.
 
 The `accelerate` option requests a compact response format from the server (shared-reference encoding). The client
 decodes it transparently.
@@ -118,14 +252,16 @@ decodes it transparently.
 ```ts
 interface IPage<T> {
   items: ReadonlyArray<T>
-  pageSize: number;
+  pageSize: number
   pageNumber: number
-  totalPages: number;
+  totalPages: number
   totalItems: number
 }
 ```
 
-Use `loadAllPages({ loadPage, pageSize?, sort? })` (from `utils`) to fetch all pages and merge them into a single array.
+Use `loadAllPages({ loadPage, pageSize?, sort? })` (from `utils`) to fetch all pages and merge them into a single array,
+see [Other utilities](#other-utilities).
+Use `sortParams(sort)` (from `api`) to format a sort order as `_sort` parameter values in custom services.
 
 ### Analytical report services
 
@@ -145,6 +281,8 @@ const report = await reportService.queryReport({
   sort: [{ field: 'month', direction: 'asc' }],
 })
 ```
+
+`reportService.fetchReportSchema()` loads the available dimensions and metrics (`GET /sales/_report/_schema`).
 
 The returned `AnalyticalReport` object provides methods for data transformation:
 
@@ -171,9 +309,9 @@ Set up an `ApiErrorHandler` at or near your application root:
 import { provideApiErrorHandler } from '@werdenktwas/kiwi-vue/services'
 
 provideApiErrorHandler({
-  transform: myTransformer,   // ApiErrorTransformer
-  consumers: [myConsumer],    // Array<ApiErrorConsumer>
-  inherit: true,              // forward to parent handler as well
+  transform: myTransformer, // ApiErrorTransformer
+  consumers: [myConsumer], // Array<ApiErrorConsumer>
+  inherit: true, // forward to parent handler as well
 })
 ```
 
@@ -190,10 +328,10 @@ If no provider is found, a fallback handler is used that logs a warning to the c
 #### `ApiErrorHandler` interface
 
 ```ts
-errorHandler.handle(error)          // transform + dispatch to consumers
-errorHandler.catch(promise)         // attach .catch() that calls handle(), rethrows
-errorHandler.format(error)          // returns formattedMessage string only
-errorHandler.wrapService(service)   // returns Proxy auto-handling all Promise rejections
+errorHandler.handle(error) // transform + dispatch to consumers
+errorHandler.catch(promise) // attach .catch() that calls handle(), rethrows
+errorHandler.format(error) // returns formattedMessage string only
+errorHandler.wrapService(service) // returns Proxy auto-handling all Promise rejections
 ```
 
 `wrapService` is the recommended pattern for services — it wraps every method so that any rejected promise is
@@ -207,6 +345,40 @@ const userService = errorHandler.wrapService(rawService)
 userService.findPage()
 ```
 
+### API errors
+
+Failed requests reject with an `ApiError`, created from the Kiwi-Server error response body
+(`{ message, arguments, errorType }`):
+
+| Property    | Description                                                                 |
+|-------------|-----------------------------------------------------------------------------|
+| `code`      | Error code (`message` of the response), e.g. `entity-not-found`             |
+| `details`   | Error details (`arguments` of the response)                                 |
+| `status`    | HTTP status code of the response                                            |
+| `errorType` | Type of the error, usually the exception class name                         |
+| `errors`    | Nested errors, e.g. one per invalid field of an `entity-body-invalid` error |
+
+Responses with status `401` (and redirects of requests not following redirects, see
+[Session cookies](#session-cookies-oauth2oidc-login)) reject with an `UnauthorizedError`, `403` with a `ForbiddenError`.
+Their code is taken from the response body if present (e.g. `access-denied`), and is `unauthorized` or `forbidden`
+otherwise, e.g. if Spring Security rejected the request without a body. Other responses without error body result in the
+code `http-error` with the detail `status`. Successful responses whose body is not valid JSON (e.g. an HTML page of a
+misconfigured proxy or development server) reject with the code `response-not-json`, with the details `status` and
+`contentType`.
+
+Kiwi-Server reports all invalid, missing and unknown body properties of generic commands together as
+`entity-body-invalid`:
+
+```ts
+try {
+  await todoItemService.create({ list, title: '' })
+} catch (error) {
+  if (error instanceof ApiError && error.code === 'entity-body-invalid') {
+    error.errors.forEach(fieldError => console.log(fieldError.code, fieldError.details.fieldName))
+  }
+}
+```
+
 ### Error transformers
 
 A transformer is a function `(error: unknown) => ApiErrorDetails`:
@@ -216,8 +388,14 @@ interface ApiErrorDetails {
   error: unknown
   rawMessage: string // technical message
   formattedMessage: string // user-facing message
+  causes?: ApiErrorDetails[] // transformed nested errors, see ApiError.errors
 }
 ```
+
+The built-in transformers transform nested errors into `causes`. If no message is found for an error with nested errors
+(e.g. `entity-body-invalid`), its `formattedMessage` consists of the formatted messages of its causes, one per line.
+Use `apiErrorTransformer(formatApiError)` to create a transformer with the same behavior from a function formatting
+`ApiError`s.
 
 #### `simpleApiErrorTransformer`
 
@@ -241,15 +419,19 @@ Translation keys in your i18n messages file:
 {
   "errors": {
     "entity-not-found": "The resource could not be found.",
-    "entity-not-found[entityType=user]": "User '{id}' does not exist.",
-    "forbidden": "Access denied."
+    "entity-not-found[entityType=de.kiwi.demo.domain.TodoItem]": "Todo item '{id}' does not exist.",
+    "entity-field-missing-value[fieldName=title]": "Please enter a title.",
+    "forbidden": "Access denied.",
+    "access-denied": "Access denied."
   }
 }
 ```
 
-Key format: `"error-code"` for a generic match, or `"error-code[key=value,key2=value2]"` for a conditional match on
-`ApiError.details`. The most specific (most conditions) matching key wins. Detail values in message templates use
-`{{argumentName}}` placeholders.
+Key format: `"error-code"` for a generic match, or `"error-code[conditions]"` for a conditional match on
+`ApiError.details`. Conditions are separated by `,`, each is either `key=value` (the detail `key` equals `value`) or
+`key` (the detail `key` is present). Codes and values are compared case-insensitively. The most specific (most
+conditions) matching key wins. Detail values are passed to `rt` as named arguments, i.e. `{argumentName}` placeholders
+in vue-i18n. Note that Kiwi-Server reports `entityType` as fully qualified class name.
 
 #### `resourceErrorTransformer` — JSON resource objects
 
@@ -261,12 +443,12 @@ import { resourceErrorTransformer } from '@werdenktwas/kiwi-vue/services'
 const transform = resourceErrorTransformer({
   'entity-not-found': 'The requested resource was not found.',
   'entity-not-found[entityType=user]': "User '{{id}}' does not exist.",
-  'forbidden': 'You do not have permission to perform this action.',
+  forbidden: 'You do not have permission to perform this action.',
 })
 ```
 
-The same key format and `{{placeholder}}` syntax applies as with `i18nErrorTransformer`. Multiple resource objects may
-be passed; they are merged.
+The same key format applies as with `i18nErrorTransformer`, detail values are inserted for `{{argumentName}}`
+placeholders. Multiple resource objects may be passed; they are merged, later resources take precedence.
 
 ### Error consumers
 
@@ -311,8 +493,13 @@ async function refresh() {
 | `failed`  | `{ loading: 'failed', error: unknown }`      | Completed with error   |
 
 When a new `load` is started while another is pending, the previous operation's result is silently discarded — only the
-latest operation updates the state.
-Upon starting a new load operation, the previous `AbortController` is aborted if one was provided.
+latest operation updates the state. Upon starting a new load operation (or calling `reset()`), the previous
+`AbortController` is aborted if one was provided. Pass its signal to the request to cancel it:
+
+```ts
+const abort = new AbortController()
+await users.load(userService.findPage({ signal: abort.signal }), { abort })
+```
 
 ### `load` options
 
@@ -329,16 +516,17 @@ await users.load(promise, { pending: true, abort: abortController })
 ### Reactive helpers
 
 ```ts
-users.state           // ShallowRef<LoadingState<T>>
-users.isLoading       // ComputedRef<boolean>
-users.resultOrNull    // ComputedRef<null | T>
+users.state // ShallowRef<LoadingState<T>>
+users.isLoading // ComputedRef<boolean>
+users.resultOrNull // ComputedRef<null | T>
 
-users.replace(r => [...r, newItem])          // update loaded result in-place
-users.reset()                                // back to idle
+users.replace(r => [...r, newItem]) // update loaded result in-place
+users.emplace(cachedUsers) // set loaded result, ignoring a pending operation
+users.reset() // back to idle, ignoring a pending operation
 
-users.computeState(r => r.length)            // ComputedRef<LoadingState<number>>
-users.computeResult(r => r.length, 0)        // ComputedRef<number>, pending → 0
-users.resultOrElse([] as User[])             // ComputedRef<User[]>, pending → []
+users.computeState(r => r.length) // ComputedRef<LoadingState<number>>, maps previousResult too
+users.computeResult(r => r.length, 0) // ComputedRef<number>, pending → 0
+users.resultOrElse([] as User[]) // ComputedRef<User[]>, pending → []
 
 users.combineStates(otherState, (a, b) => ({ a, b })) // merge two loading states
 ```
@@ -351,9 +539,12 @@ users.combineStates(otherState, (a, b) => ({ a, b })) // merge two loading state
 import { Compare, sorting, Ordinal } from '@werdenktwas/kiwi-vue/utils'
 ```
 
-`Compare<T>` is a comparator function `(a: T, b: T) => Ordinal` (values: `-1`, `0`, `+1`).
+`Compare<T>` is a comparator function `(a: T, b: T) => Ordinal` (values: `Ordinal.LT = -1`, `Ordinal.EQ = 0`,
+`Ordinal.GT = +1`).
 
-`sorting(compare?)` returns a function `(array: ReadonlyArray<T>) => T[]` — useful as a pipeline step.
+`sorting(compare?)` returns a function `(array: ReadonlyArray<T>) => T[]` returning a sorted copy — useful as a pipeline
+step. Unlike `Array.prototype.sort`, it passes `undefined` items to the comparator as well (e.g. for
+`Compare.nullsFirst`).
 
 ```ts
 const byName = Compare.byKey('name', Compare.caseInsensitive)
@@ -364,7 +555,7 @@ const sorted = sortUsers(users)
 | Comparator                    | Description                            |
 |-------------------------------|----------------------------------------|
 | `Compare.natural`             | JS `>` / `<` operators                 |
-| `Compare.number`              | `a - b`                                |
+| `Compare.number`              | Sign of `a - b`                        |
 | `Compare.caseInsensitive`     | `localeCompare` with base sensitivity  |
 | `Compare.reverse(cmp?)`       | Reverse order                          |
 | `Compare.byKey(key, cmp?)`    | Compare by object property             |
@@ -385,10 +576,7 @@ invalid (string is the error reason).
 A `Validation<T>` is a factory: `(message?: string | false) => ValidationRule<T>`.
 
 ```ts
-const nameRule = validateEvery([
-  isNotBlank('Name must not be blank'),
-  requireLength({ max: 100 })('Name is too long'),
-])
+const nameRule = validateEvery([isNotBlank('Name must not be blank'), requireLength({ max: 100 })('Name is too long')])
 ```
 
 #### Built-in validations
@@ -400,22 +588,22 @@ const nameRule = validateEvery([
 | `isPositive`                     | Number > 0                        |
 | `isNegative`                     | Number < 0                        |
 | `requireLength({ min?, max? })`  | String length in range            |
-| `requireBetween({ min?, max? })` | Number in range                   |
+| `requireBetween({ min?, max? })` | Number in range, or `undefined`   |
 | `requireMatches(regex)`          | String matches pattern            |
 | `isValidEmail`                   | Basic e-mail format               |
-| `isLikeInt`                      | Parseable as integer              |
+| `isLikeInt`                      | Integer format, e.g. `-12`        |
 | `isLikeFloat`                    | Parseable as float                |
 
 #### Conditional and composite
 
 ```ts
-validateIf(predicate, rule)        // apply rule only when predicate is true
-validateIfNotBlank(rule)           // apply rule only when string is not blank
-validateIfNotEmpty(rule)           // apply rule only when string is not empty
-validateOptional(rule)             // apply rule only when value is truthy
-validateAsInt(message, numRule)    // parse string as int, then apply numeric rule
-validateEvery([...rules])          // AND — fails on first failure
-validateSome([...rules])           // OR — succeeds if any rule succeeds
+validateIf(predicate, rule) // apply rule only when predicate is true
+validateIfNotBlank(rule) // apply rule only when string is not blank
+validateIfNotEmpty(rule) // apply rule only when string is not empty
+validateOptional(rule) // apply rule only when value is truthy
+validateAsInt(message, numRule) // require integer format (see isLikeInt), then apply numeric rule
+validateEvery([...rules]) // AND — fails on first failure
+validateSome([...rules]) // OR — succeeds if any rule succeeds
 ```
 
 ### Other utilities
@@ -427,9 +615,12 @@ import { loadAllPages } from '@werdenktwas/kiwi-vue/utils'
 const allUsers = await loadAllPages({
   loadPage: pagination => userService.findPage({ ...pagination }),
   pageSize: 200,
-  sort: { field: 'id', direction: 'asc' },
+  sort: { field: 'id', direction: 'asc' }, // or an array of sort orders
 })
 ```
+
+The first page is loaded to determine the number of pages, the remaining pages are loaded concurrently. Use a sort order
+that is unique per item (the default sorts by `id`), so that no item appears on several pages.
 
 ```ts
 import { deferPromise } from '@werdenktwas/kiwi-vue/utils'
@@ -452,10 +643,14 @@ import { TODO, unreachable } from '@werdenktwas/kiwi-vue/utils'
 const value = TODO('implement this branch')
 
 // Exhaustive switch guard — TypeScript error if a case is missing
-switch (...) {
-  case ...: break;
-  default: unreachable(state)
-}
+switch (
+  ...)
+  {
+  case ...:
+    break;
+  default:
+    unreachable(state)
+  }
 ```
 
 ## Vue Components
@@ -505,7 +700,6 @@ Passing a `LoadingService<T>` directly (instead of `LoadingState<T>`) is equival
 Catches errors thrown by child component trees using Vue's `onErrorCaptured` hook and renders a fallback `#error` slot.
 
 ```vue
-
 <ErrorBoundary stop-propagation @error-caught="logError">
   <template #default>
     <UserProfile :id="userId" />
@@ -564,3 +758,14 @@ export default defineConfig({
 The resolver maps component names to the `@werdenktwas/kiwi-vue/components` entry point. TypeScript types for global
 components are provided automatically via the `components/index.ts` module augmentation — add it to your `tsconfig.json`
 includes if global type inference is needed.
+
+## Development
+
+```sh
+npm install
+npm test         # Run unit tests (Vitest)
+npm run coverage # Run unit tests with coverage report (coverage/)
+npm run build    # Type-check and build the library into dist/
+npm run lint     # Lint and fix sources (ESLint)
+npm run format   # Format sources (Prettier)
+```

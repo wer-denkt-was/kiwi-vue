@@ -36,3 +36,11 @@ export interface Sort {
   readonly field: string
   readonly direction: 'asc' | 'desc'
 }
+
+/**
+ * Format a sorting order as values of the `_sort` query parameter, i.e. `{field},{direction}` per sort.
+ * @example sortParams([{ field: 'title', direction: 'asc' }]) // ['title,asc']
+ */
+export function sortParams(sort: ReadonlyArray<Sort>): Array<string> {
+  return sort.map(({ field, direction }) => `${field},${direction}`)
+}

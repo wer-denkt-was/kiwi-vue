@@ -1,4 +1,4 @@
-<script setup lang="ts">
+<script lang="ts" setup>
 const props = defineProps<{
   stopPropagation?: boolean
   consoleLog?: 'warn' | 'error'
@@ -39,5 +39,5 @@ onErrorCaptured((error, _vm, info) => {
 
 <template>
   <slot v-if="!slots.error || !caught" name="default" />
-  <slot v-if="slots.error && caught" name="error" :reset-error="resetError" v-bind="caught" />
+  <slot v-if="slots.error && caught" :reset-error="resetError" name="error" v-bind="caught" />
 </template>

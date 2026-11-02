@@ -4,17 +4,29 @@
  * - EQ "equal" = 0
  * - GT "greater than" = +1
  */
-export const enum Ordinal {
-  LT = -1,
-  EQ = 0,
-  GT = +1,
-}
+export const Ordinal = {
+  LT: -1,
+  EQ: 0,
+  GT: +1,
+} as const
 
-/** Create a function for sorting arrays using the given {@link Compare} function. */
+export type Ordinal = (typeof Ordinal)[keyof typeof Ordinal]
+
+/**
+ * Create a function for sorting arrays using the given {@link Compare} function, returning a sorted copy.
+ * Unlike `Array.prototype.sort`, `undefined` items are compared by the function as well, instead of being placed last.
+ * Without a function, items are sorted like `Array.prototype.sort` without comparator.
+ */
 export const sorting =
   <T>(compare?: Compare<T>) =>
-  (array: ReadonlyArray<T>) =>
-    [...array].sort(compare)
+  (array: ReadonlyArray<T>): Array<T> => {
+    if (!compare) return [...array].sort()
+    // Sort indices, as Array.prototype.sort does not pass undefined items to the compare function
+    return array
+      .map((_, index) => index)
+      .sort((a, b) => compare(array[a] as T, array[b] as T))
+      .map(index => array[index] as T)
+  }
 
 /**
  * Function comparing to items to define a sort order.
@@ -29,13 +41,14 @@ export namespace Compare {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   export const natural: Compare<any> = (a, b) => (a > b ? Ordinal.GT : a < b ? Ordinal.LT : Ordinal.EQ)
 
-  /** Compare two numbers by subtracting `b` from `a`. */
-  export const number: Compare<number> = (a, b) => a - b
+  /** Compare two numbers by the sign of subtracting `b` from `a`. */
+  export const number: Compare<number> = (a, b) => Math.sign(a - b) as Ordinal
 
   const baseSensitivity = { sensitivity: 'base' } as const
 
   /** Compare two strings case-insensitively. */
-  export const caseInsensitive: Compare<string> = (a, b) => a.localeCompare(b, undefined, baseSensitivity)
+  export const caseInsensitive: Compare<string> = (a, b) =>
+    Math.sign(a.localeCompare(b, undefined, baseSensitivity)) as Ordinal
 
   type Reverse = <T>(compare?: Compare<T>) => Compare<T>
   /** Reverse a given comparator by passing the items to be compared in inverse order. */

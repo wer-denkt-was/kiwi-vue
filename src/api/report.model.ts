@@ -30,6 +30,22 @@ export interface Slice {
   not?: Slice
 }
 
+/**
+ * Available dimension- and metric-fields of an analytical report, as returned by `GET /<entity>/_report/_schema`
+ */
+export interface AnalyticalReportSchema {
+  readonly dimensions: ReadonlyArray<AnalyticalReportSchema.Field>
+  readonly metrics: ReadonlyArray<AnalyticalReportSchema.Field>
+}
+
+// eslint-disable-next-line @typescript-eslint/no-namespace
+export namespace AnalyticalReportSchema {
+  export interface Field {
+    readonly name: string
+    readonly valueType: string
+  }
+}
+
 export interface IAnalyticalReport {
   readonly headers: ReadonlyArray<string>
   readonly body: ReadonlyArray<AnalyticalReport.Row>

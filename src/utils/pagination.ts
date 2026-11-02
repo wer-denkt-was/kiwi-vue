@@ -3,25 +3,34 @@ import type { IPage, Pagination, Sort } from '@/api/page.model'
 // This assumes that entities commonly have a sortable field named "id"
 const defaultSort: Sort = { field: 'id', direction: 'asc' }
 
-interface Options<T> {
-  loadPage(pagination: Pagination): Promise<IPage<T>>
-
+/**
+ * Options of {@link loadAllPages}
+ * @property loadPage Function loading a single page
+ * @property pageSize Number of items per page, defaults to 100
+ * @property sort Sorting order, defaults to sorting by `id` ascending. Use a total order, as the pages are loaded
+ * concurrently, and items could otherwise appear on several pages.
+ */
+export interface LoadAllPagesOptions<T> {
   pageSize?: number
-  sort?: Sort
+  sort?: Sort | ReadonlyArray<Sort>
+
+  loadPage(pagination: Pagination): Promise<IPage<T>>
 }
 
 /**
  * Helper function to load items of a paginated dataset across all pages
  */
-export async function loadAllPages<T>(options: Options<T>): Promise<ReadonlyArray<T>> {
+export async function loadAllPages<T>(options: LoadAllPagesOptions<T>): Promise<ReadonlyArray<T>> {
   const { pageSize = 100, sort = defaultSort } = options
-  const loadPage = (pageNumber: number) => options.loadPage({ pageNumber, pageSize, sort: [sort] })
+  const sortArray: ReadonlyArray<Sort> = Array.isArray(sort) ? sort : [sort as Sort]
+  const loadPage = (pageNumber: number) => options.loadPage({ pageNumber, pageSize, sort: sortArray })
 
   // Load first page to obtain pagination info
   const firstPage = await loadPage(0)
 
-  // Exit early if first page is complete
-  if (pageSize >= firstPage.totalItems) {
+  // Exit early if first page is complete.
+  // The server may cap the page size (`kiwi.pagination.max-page-size`), so the requested page size is not relevant.
+  if (firstPage.totalPages <= 1) {
     return firstPage.items
   }
 

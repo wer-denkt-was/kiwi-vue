@@ -1,11 +1,17 @@
 import { MaybeRefOrGetter } from 'vue'
 import { ApiCredentials } from '@/api/credentials.model'
 import { Accelerated, decelerate } from '@/utils/decelerator'
-import { ApiError, CredentialsInvalid, ForbiddenError } from '@/api'
+import { ApiError, CredentialsInvalid, UnauthorizedError } from '@/api'
 
 export type ParamValue = null | undefined | string | number | boolean
 export type ParamValues = ParamValue | ReadonlyArray<ParamValue>
-export type RequestParams = Record<string, ParamValues>
+export type RequestParams = Readonly<Record<string, ParamValues>>
+
+/** HTTP methods of requests with a JSON body */
+export type JsonRequestMethod = 'POST' | 'PUT' | 'PATCH' | 'DELETE'
+
+/** Application header for specifying Content-Type: application/json */
+export const contentTypeJson = { 'Content-Type': 'application/json' } as const
 
 /**
  * Interface for communicating with a remote API.
@@ -13,39 +19,63 @@ export type RequestParams = Record<string, ParamValues>
  * or may post-process the received response before returning it.
  */
 export interface Api {
-  /** Base URL of API */
+  /** Base URL of API, always ending with a slash */
   readonly baseUrl: Readonly<URL>
 
-  /** Execute an HTTP request against an endpoint path with parameters */
-  request(path: string, params: RequestParams, init: RequestInit): Promise<Response>
+  /**
+   * Execute an HTTP request against an endpoint path with query parameters.
+   * The path is resolved relative to {@link baseUrl}, leading slashes are ignored:
+   * with the base URL `https://example.com/api/`, the path `/TodoItem` requests `https://example.com/api/TodoItem`.
+   */
+  request(path: string, params?: RequestParams, init?: RequestInit): Promise<Response>
 
-  /** Execute an HTTP request against an absolute or relative (to {@link baseUrl}) URL */
-  request(input: URL, init: RequestInit): Promise<Response>
+  /** Execute an HTTP request against an absolute URL */
+  request(input: URL, init?: RequestInit): Promise<Response>
 
-  /** Execute an HTTP POST/PUT request with a JSON request body */
-  jsonRequest(path: string, body: object, method: 'PUT' | 'POST'): Promise<Response>
+  /** Execute an HTTP request with a JSON request body against an endpoint path with query parameters */
+  jsonRequest(
+    path: string,
+    body: unknown,
+    method: JsonRequestMethod,
+    params?: RequestParams,
+    init?: RequestInit,
+  ): Promise<Response>
 }
 
 const apiKey = Symbol('api') as InjectionKey<Api>
 
 export interface ApiOptions {
+  /** Base URL of the API, a trailing slash is appended if missing */
   apiUrl: string | URL
+  /** Credentials authenticating each request, evaluated for each request */
   credentials: MaybeRefOrGetter<ApiCredentials>
+  /** Fetch implementation used to execute requests, defaults to the global `fetch` */
+  fetch?: typeof fetch
 }
 
 /**
- * Create and provide an {@link Api} instance in the current context.
+ * Create an {@link Api} instance, e.g. for usage outside of components.
+ * @see provideApi
  */
-export function provideApi(options: ApiOptions): Api {
-  const api = new FetchApi(options.apiUrl, (input, init) => {
+export function createApi(options: ApiOptions): Api {
+  return new FetchApi(options.apiUrl, options.fetch, async (input, init) => {
     const credentials = toValue(options.credentials)
     if (!credentials.isValid()) {
       throw new CredentialsInvalid(credentials)
     }
+    await credentials.prepare?.(init)
     const processedInput = credentials.rewrite?.(input) ?? input
     const processedInit = credentials.authenticate(init)
     return [processedInput, processedInit]
   })
+}
+
+/**
+ * Provide an {@link Api} instance in the current context, either the given instance,
+ * or a new instance created from the given {@link ApiOptions}.
+ */
+export function provideApi(apiOrOptions: Api | ApiOptions): Api {
+  const api = 'request' in apiOrOptions ? apiOrOptions : createApi(apiOrOptions)
   provide(apiKey, api)
   return api
 }
@@ -77,86 +107,109 @@ export function useApiService<S>(service: ServiceConstructor<S>): S {
 /**
  * Utility function for unwrapping an {@link Api} JSON {@link Response},
  * either resolving the response JSON body or throwing an {@link ApiError} if the response indicates an error status.
+ * An empty response body (e.g. `204 No Content`) resolves to `undefined`. A response body that is not valid JSON,
+ * e.g. an HTML page of a misconfigured proxy or development server, rejects with the error code `response-not-json`.
  */
 export async function unwrapResponseJson<R>(response: Response, accelerated: undefined | boolean = false): Promise<R> {
-  if (response.ok) {
-    const responseBody = await response.json()
-    return unwrapResponseJsonBody<R>(responseBody, accelerated)
-  } else if (response.status === 403) {
-    throw new ForbiddenError() // HTTP Forbidden does not have a response body
-  } else {
-    const responseBody = await response.json()
-    throw unwrapResponseError(responseBody)
+  if (!response.ok) {
+    throw await readResponseError(response)
+  }
+  const responseText = await response.text()
+  const responseBody = responseText ? parseResponseJson(response, responseText) : undefined
+  return accelerated && responseBody !== undefined
+    ? (decelerate(responseBody as Accelerated) as R)
+    : (responseBody as R)
+}
+
+/**
+ * Read the body of an HTTP error response, and convert it into an {@link ApiError}.
+ * Kiwi-Server error responses contain a JSON body with an error code (`message`), `arguments` and an `errorType`.
+ * Responses without such a body (e.g. errors of a proxy, or of Spring Security filters) result in an error by status.
+ * Redirects of requests that don't follow redirects (`redirect: 'manual'`, e.g. of {@link SessionCredentials}) are
+ * considered redirects to a login page, and result in an {@link UnauthorizedError}.
+ * @see ApiError.fromResponse
+ */
+export async function readResponseError(response: Response): Promise<ApiError> {
+  if (response.type === 'opaqueredirect') {
+    return new UnauthorizedError(undefined, response.status)
+  }
+  const responseText = await response.text().catch(() => '')
+  return ApiError.fromResponse(response.status, parseJsonOrText(responseText))
+}
+
+function parseResponseJson(response: Response, text: string): unknown {
+  try {
+    return JSON.parse(text)
+  } catch (cause: unknown) {
+    const { status } = response
+    const contentType = response.headers.get('Content-Type')
+    throw new ApiError('response-not-json', { status, contentType }, { status, cause })
   }
 }
 
-function unwrapResponseJsonBody<R>(responseBody: unknown, accelerated: undefined | boolean): R {
-  if (!accelerated) {
-    return responseBody as R
-  } else {
-    return decelerate(responseBody as Accelerated) as R
+function parseJsonOrText(text: string): unknown {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return text
   }
-}
-
-function unwrapResponseError(errorBody: unknown): ApiError {
-  // Handle string error
-  if (typeof errorBody === 'string') {
-    return new ApiError(errorBody, {})
-  }
-  // Handle error response object with message and arguments from API
-  if (typeof errorBody === 'object' && errorBody !== null) {
-    const message = 'message' in errorBody ? String(errorBody.message) : '<unknown>'
-    const details = 'arguments' in errorBody ? errorBody.arguments : {}
-    return new ApiError(message, details as Record<string, unknown>)
-  }
-  // Handle other errors
-  return new ApiError(String(errorBody), { responseType: typeof errorBody })
 }
 
 type RequestInput = string | URL
 
 interface RequestPreprocessor {
-  (input: RequestInput, init: RequestInit): readonly [RequestInput, RequestInit]
+  (input: RequestInput, init: RequestInit): RequestPreprocessorResult | Promise<RequestPreprocessorResult>
 }
+
+type RequestPreprocessorResult = readonly [RequestInput, RequestInit]
 
 export class FetchApi implements Api {
   readonly baseUrl: URL
 
   constructor(
-    private readonly base: RequestInput,
-    private readonly requestPreprocessor: RequestPreprocessor,
+    base: RequestInput,
+    private readonly fetchFn: typeof fetch = (input, init) => fetch(input, init),
+    private readonly requestPreprocessor: RequestPreprocessor = (input, init) => [input, init] as const,
   ) {
-    this.baseUrl = new URL(this.base)
+    this.baseUrl = withTrailingSlash(base)
   }
 
-  jsonRequest(path: RequestInput, body: object, method: 'PUT' | 'POST'): Promise<Response> {
-    const jsonHeaders = { 'Content-Type': 'application/json' }
-    return this.request(path, {}, { method, body: JSON.stringify(body), headers: jsonHeaders })
-  }
-
-  request(input: URL, init: RequestInit): Promise<Response>
-  request(path: RequestInput, params: RequestParams, init: RequestInit): Promise<Response>
-  request(
-    pathOrUrl: RequestInput,
-    initOrParams: RequestInit | RequestParams,
-    maybeInit?: RequestInit,
+  jsonRequest(
+    path: string,
+    body: unknown,
+    method: JsonRequestMethod,
+    params: RequestParams = {},
+    init: RequestInit = {},
   ): Promise<Response> {
-    if (maybeInit) {
-      const path = pathOrUrl as string
-      const params = initOrParams as RequestParams
-      const url = new URL(endpoint(path, params), this.base)
-      return this.processAndFetch(url, maybeInit)
+    const headers = new Headers(init.headers)
+    headers.set('Content-Type', contentTypeJson['Content-Type'])
+    return this.request(path, params, { ...init, method, headers, body: JSON.stringify(body) })
+  }
+
+  request(input: URL, init?: RequestInit): Promise<Response>
+  request(path: string, params?: RequestParams, init?: RequestInit): Promise<Response>
+  request(pathOrUrl: RequestInput, initOrParams?: RequestInit | RequestParams, maybeInit?: RequestInit) {
+    if (pathOrUrl instanceof URL) {
+      return this.processAndFetch(pathOrUrl, (initOrParams ?? {}) as RequestInit)
     } else {
-      const url = pathOrUrl instanceof URL ? pathOrUrl : new URL(pathOrUrl, this.base)
-      const init = initOrParams as RequestInit
-      return this.processAndFetch(url, init)
+      const params = (initOrParams ?? {}) as RequestParams
+      const url = new URL(endpoint(pathOrUrl, params), this.baseUrl)
+      return this.processAndFetch(url, maybeInit ?? {})
     }
   }
 
-  private processAndFetch(url: URL, init: RequestInit): Promise<Response> {
-    const [processedInput, processedInit] = this.requestPreprocessor(url, init)
-    return fetch(processedInput, processedInit)
+  private async processAndFetch(url: URL, init: RequestInit): Promise<Response> {
+    const [processedInput, processedInit] = await this.requestPreprocessor(url, init)
+    return this.fetchFn(processedInput, processedInit)
   }
+}
+
+function withTrailingSlash(input: RequestInput): URL {
+  const url = new URL(input)
+  if (!url.pathname.endsWith('/')) {
+    url.pathname = `${url.pathname}/`
+  }
+  return url
 }
 
 function isParamValue(value: unknown): value is NonNullable<ParamValue> {
@@ -177,6 +230,8 @@ function endpoint(path: string, params: RequestParams): string {
     }
   })
 
+  // Paths are relative to the base URL, leading slashes would resolve them against the origin
+  const relativePath = path.replace(/^\/+/, '')
   const search = query.toString()
-  return search ? `${path}?${search}` : path
+  return search ? `${relativePath}?${search}` : relativePath
 }

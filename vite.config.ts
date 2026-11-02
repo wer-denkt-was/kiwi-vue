@@ -1,6 +1,6 @@
+/// <reference types="vitest/config" />
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
-import vueDevTools from 'vite-plugin-vue-devtools'
 import dts from 'vite-plugin-dts'
 import autoImport from 'unplugin-auto-import/vite'
 
@@ -12,7 +12,6 @@ const resolve = (path: string) => fileURLToPath(new URL(path, import.meta.url))
 export default defineConfig({
   plugins: [
     vue(),
-    vueDevTools(),
     autoImport({
       imports: ['vue'],
       dts: true,
@@ -43,7 +42,7 @@ export default defineConfig({
       },
     },
     rolldownOptions: {
-      external: ['vue', 'vue-toast-notification'],
+      external: ['vue'],
       output: {
         chunkFileNames: 'assets/chunk-[hash].js',
         assetFileNames: 'assets/asset-[hash][extname]',
@@ -53,5 +52,12 @@ export default defineConfig({
     sourcemap: true,
     emptyOutDir: true,
     copyPublicDir: false,
+  },
+  test: {
+    include: ['tests/**/*.test.ts'],
+    coverage: {
+      include: ['src/**/*.{ts,vue}'],
+      exclude: ['src/**/index.ts', 'src/vite-env.d.ts'],
+    },
   },
 })
